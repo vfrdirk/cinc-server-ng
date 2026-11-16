@@ -1,0 +1,12 @@
+# gitleaks config for the peach fork (security-ci runs gitleaks over full history).
+# Not for upstream.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Confirmed false positives"
+paths = [
+  # Upstream's Mixlib::Authentication test vectors (commit fa62263): a published
+  # test keypair used to check signature verification, not a credential.
+  '''internal/auth/testdata/vectors\.json''',
+]
