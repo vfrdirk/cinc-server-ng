@@ -34,6 +34,7 @@ func Run(t *testing.T, newBackend func(t *testing.T) store.Backend) {
 	t.Run("DeleteOrgIsolation", func(t *testing.T) { testDeleteOrgIsolation(t, newBackend(t)) })
 	t.Run("SortOrderFidelity", func(t *testing.T) { testSortOrderFidelity(t, newBackend(t)) })
 	t.Run("OpaqueBodies", func(t *testing.T) { testOpaqueBodies(t, newBackend(t)) })
+	t.Run("ControlBytesInKeys", func(t *testing.T) { testControlBytesInKeys(t, newBackend(t)) })
 	t.Run("Concurrency", func(t *testing.T) { testConcurrency(t, newBackend(t)) })
 	t.Run("TxCommit", func(t *testing.T) { testTxCommit(t, newBackend(t)) })
 	t.Run("TxRollback", func(t *testing.T) { testTxRollback(t, newBackend(t)) })
@@ -572,5 +573,50 @@ func testMetaDeleteOrg(t *testing.T, b store.Backend) {
 	}
 	if _, ok, err := b.Meta("acme", "nodes", "web"); err != nil || ok {
 		t.Fatalf("Meta after DeleteOrg: ok=%v err=%v", ok, err)
+	}
+}
+
+// testControlBytesInKeys pins that a key may contain any byte, NUL included, and
+// still round-trips and deletes, and Keys still sorts as sort.Strings does. The api layer
+// depends on it: group-membership rows are keyed "<group>\x00<kind>\x00<actor>"
+// (internal/api/groupmembers.go), so a backend that cannot store NUL in a key
+// loses every client's membership in the clients group, and freshly registered
+// clients then cannot create their own node.
+func testControlBytesInKeys(t *testing.T, b store.Backend) {
+	keys := []string{"clients\x00clients\x00web01", "clients\x00users\x00alice", "a\x01b", "a\x00b", "a", "a\x02", "admins\x00clients\x00x", "\x00lead", "z\x01\x01"}
+	for i, k := range keys {
+		mustPut(t, b, "acme", "group_members", k, fmt.Sprintf(`{"i":%d}`, i))
+	}
+	for i, k := range keys {
+		got, ok, err := b.Get("acme", "group_members", k)
+		if err != nil || !ok || string(got) != fmt.Sprintf(`{"i":%d}`, i) {
+			t.Fatalf("Get(%q) = %q ok=%v err=%v", k, got, ok, err)
+		}
+	}
+	want := append([]string(nil), keys...)
+	sort.Strings(want)
+	got, err := b.Keys("acme", "group_members")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprintf("%q", got) != fmt.Sprintf("%q", want) {
+		t.Fatalf("Keys with control bytes:\n got=%q\nwant=%q", got, want)
+	}
+	var ranged []string
+	if err := b.Range("acme", "group_members", func(k string, _ []byte) bool { ranged = append(ranged, k); return true }); err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(ranged) // Range order is not part of the contract (the memory backend is map order)
+	if fmt.Sprintf("%q", ranged) != fmt.Sprintf("%q", want) {
+		t.Fatalf("Range keys with control bytes:\n got=%q\nwant=%q", ranged, want)
+	}
+	if _, existed, err := b.Delete("acme", "group_members", "clients\x00clients\x00web01"); err != nil || !existed {
+		t.Fatalf("Delete NUL key: existed=%v err=%v", existed, err)
+	}
+	if _, ok, _ := b.Get("acme", "group_members", "clients\x00clients\x00web01"); ok {
+		t.Fatal("NUL key still present after Delete")
+	}
+	if err := b.Create("acme", "group_members", "clients\x00users\x00alice", []byte(`{}`), store.Stamp{}); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("Create over an existing NUL key: want ErrConflict, got %v", err)
 	}
 }

@@ -165,8 +165,9 @@ SQLite database:
 ./cinc-server-ng --storage sqlite --db ./cinc.db
 ```
 
-`--storage` accepts `memory` (default) or `sqlite`; `--storage sqlite` requires
-`--db <path>`. Both flags also read from the environment
+`--storage` accepts `memory` (default), `sqlite` or `postgres`; `--storage sqlite`
+requires `--db <path>`, and `--storage postgres` requires `--db` set to a
+connection string (see [PostgreSQL](#postgresql) below). Both flags also read from the environment
 (`CINC_SERVER_NG_STORAGE`, `CINC_SERVER_NG_DB`), which is handy in containers. SQLite uses
 the pure-Go [`modernc.org/sqlite`](https://pkg.go.dev/modernc.org/sqlite) driver,
 so the static binary and `scratch`/`distroless` images keep working with
@@ -189,8 +190,47 @@ so a lone serialized writer (a CI fixture doing one thing at a time) can turn
 it off with `--sqlite-group-commit=false`.
 
 The storage layer is pluggable behind a small `store.Backend` interface
-(`(org, collection, key) → bytes` plus a blob store), so PostgreSQL/RDS can be
-added later as a driver swap rather than a rewrite.
+(`(org, collection, key) → bytes` plus a blob store), which both SQLite and
+PostgreSQL implement.
+
+### PostgreSQL
+
+When the database belongs on managed infrastructure (RDS, Cloud SQL, an
+existing PostgreSQL cluster with its own backups, replicas and monitoring), use
+PostgreSQL:
+
+```sh
+export CINC_SERVER_NG_DB='postgres://cinc:secret@db.example:5432/cinc_ng?sslmode=require'
+./cinc-server-ng --storage postgres
+```
+
+Keep the password in `CINC_SERVER_NG_DB` (or a `~/.pgpass` file, which the pure-Go
+[pgx](https://github.com/jackc/pgx) driver reads) rather than on the command line,
+where every process listing shows it. The server never prints it: the startup
+banner and connection errors show the connection string with the password
+masked.
+
+- **Schema.** The same tables as SQLite (`objects`, `blobs`, `orgs`,
+  `schema_migrations`), created and migrated automatically at startup, under a
+  PostgreSQL advisory lock so two servers starting at once (a failover overlap,
+  say) cannot both migrate. The database user needs to own the
+  tables (or have `CREATE` on the schema for a new database).
+- **One active server per database, for now.** Each server keeps its search
+  index and group-membership cache in memory, built from the database and then
+  kept current from its own writes only. A second server writing to the same
+  database would leave the first one's search results and authorization checks
+  stale until it restarts. Run one server against a database, with a standby
+  that is started only on failover. (Sharing between active servers needs the
+  caches invalidated across servers, for example with PostgreSQL
+  `LISTEN`/`NOTIFY`; that is not built yet.)
+- **Other tables.** Tables, views and triggers you add to the same database (a
+  reporting feed, say) are left alone by migrations.
+- **Backups.** Use `pg_dump` or your platform's snapshots.
+- **Tests.** The backend runs the same `store.Backend` contract suite as SQLite
+  and the memory backend, plus the server's bootstrap tests. They need a
+  PostgreSQL to create throwaway databases in:
+  `CINC_SERVER_NG_TEST_POSTGRES=postgres://postgres:pw@localhost/postgres go test ./...`
+  (without it they skip).
 
 **Object times.** As Chef Infra Server does, every object records when it was
 created and last changed, and which user or client changed it last. These are
@@ -224,7 +264,7 @@ For SQLite, any of these gives a consistent copy:
 - **A file copy with the server stopped.** Copying the `.db` file of a running
   server is not safe: recent writes may only be in its `-wal` file.
 
-(A future Postgres/RDS backend would use `pg_dump` or managed snapshots.)
+(For PostgreSQL, use `pg_dump` or managed snapshots.)
 
 **Upgrades** are forward-only: the SQLite schema carries a `schema_migrations`
 version and any pending migrations are applied automatically at startup, so

@@ -26,6 +26,7 @@ import (
 	"github.com/cinc-project/cinc-server-ng/internal/repo"
 	"github.com/cinc-project/cinc-server-ng/internal/state"
 	"github.com/cinc-project/cinc-server-ng/internal/store"
+	"github.com/cinc-project/cinc-server-ng/internal/store/postgres"
 	"github.com/cinc-project/cinc-server-ng/internal/store/sqlite"
 )
 
@@ -75,10 +76,13 @@ type Options struct {
 	// handler reads the uploaded file fully into memory). Defaults to 1 GiB; set
 	// a negative value to disable the limit.
 	MaxBodyBytes int64
-	// Storage selects the persistence backend: "memory" (default, ephemeral) or
-	// "sqlite" (durable). Ignored when Backend is set.
+	// Storage selects the persistence backend: "memory" (default, ephemeral),
+	// "sqlite" (durable, one file) or "postgres" (durable, shareable by several
+	// servers). Ignored when Backend is set.
 	Storage string
-	// DB is the SQLite database file path; required when Storage is "sqlite".
+	// DB is the SQLite database file path when Storage is "sqlite", or the
+	// PostgreSQL connection string (postgres://user:pass@host/db) when Storage is
+	// "postgres"; required for both.
 	DB string
 	// SQLiteGroupCommit enables the SQLite coalescing writer (group commit): under
 	// concurrent fleet write load it batches pending writes into shared
@@ -141,7 +145,8 @@ func (o *Options) withDefaults() {
 
 // buildStore constructs the data store for the given options: an injected Backend
 // if provided, otherwise the selected Storage backend — in-memory by default (the
-// ephemeral "zero" experience) or SQLite (durable) when Storage is "sqlite".
+// ephemeral "zero" experience), SQLite (durable) when Storage is "sqlite", or
+// PostgreSQL (durable, shared) when Storage is "postgres".
 func buildStore(opts Options) (*store.Store, error) {
 	if opts.Backend != nil {
 		return store.NewWithBackend(opts.Backend), nil
@@ -162,8 +167,19 @@ func buildStore(opts Options) (*store.Store, error) {
 			return nil, fmt.Errorf("open sqlite %q: %w", opts.DB, err)
 		}
 		return store.NewWithBackend(b), nil
+	case "postgres":
+		if opts.DB == "" {
+			return nil, errors.New(`storage "postgres" requires a connection string (Options.DB / --db)`)
+		}
+		b, err := postgres.Open(opts.DB)
+		if err != nil {
+			// The connection string carries the password; name the database
+			// without it.
+			return nil, fmt.Errorf("open postgres %s: %w", postgres.Redact(opts.DB), err)
+		}
+		return store.NewWithBackend(b), nil
 	default:
-		return nil, fmt.Errorf("unknown storage %q (want %q or %q)", opts.Storage, "memory", "sqlite")
+		return nil, fmt.Errorf("unknown storage %q (want %q, %q or %q)", opts.Storage, "memory", "sqlite", "postgres")
 	}
 }
 

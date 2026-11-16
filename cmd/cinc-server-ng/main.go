@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cinc-project/cinc-server-ng/internal/store/postgres"
 	"github.com/cinc-project/cinc-server-ng/server"
 )
 
@@ -77,8 +78,8 @@ func parseFlags(args []string, out io.Writer) (*cliFlags, error) {
 	fs.StringVar(&f.repo, "repo", "", "path to a chef-repo to load into the first org at startup")
 	fs.StringVar(&f.state, "state", "", "path to a full server-state directory to load at startup")
 	fs.StringVar(&f.webuiKey, "webui-key", "", "path to a webui public/private key for X-Ops-Request-Source: web impersonation (defaults to the admin key)")
-	fs.StringVar(&f.storage, "storage", envOr("CINC_SERVER_NG_STORAGE", "memory"), "storage backend: memory (ephemeral) or sqlite (durable)")
-	fs.StringVar(&f.db, "db", os.Getenv("CINC_SERVER_NG_DB"), "sqlite database file path (required when --storage sqlite)")
+	fs.StringVar(&f.storage, "storage", envOr("CINC_SERVER_NG_STORAGE", "memory"), "storage backend: memory (ephemeral), sqlite (durable, one file) or postgres (durable, shareable by several servers)")
+	fs.StringVar(&f.db, "db", os.Getenv("CINC_SERVER_NG_DB"), "sqlite database file path, or postgres connection string postgres://user:pass@host/db (required for --storage sqlite or postgres; CINC_SERVER_NG_DB keeps a password off the command line)")
 	fs.BoolVar(&f.groupCommit, "sqlite-group-commit", true, "batch concurrent sqlite writes into shared transactions: much higher write throughput and far better tail latency under fleet load, at a few microseconds more on a serialized single-client write; pass --sqlite-group-commit=false to opt out")
 	fs.StringVar(&f.statsUser, "stats-user", envOr("CINC_SERVER_NG_STATS_USER", server.DefaultStatsUser), "HTTP Basic user for GET /_stats")
 	// The password's flag default stays empty so a value taken from the
@@ -197,9 +198,12 @@ func run(args []string, out io.Writer) error {
 	// --init seeds the store (bootstrap plus any --state/--repo load happened in
 	// server.New) and exits without serving, leaving a populated database behind.
 	if f.initOnly {
-		if f.storage == "sqlite" {
+		switch f.storage {
+		case "sqlite":
 			fmt.Fprintf(out, "initialized sqlite database %s; exiting without serving\n", f.db)
-		} else {
+		case "postgres":
+			fmt.Fprintf(out, "initialized postgres database %s; exiting without serving\n", postgres.Redact(f.db))
+		default:
 			fmt.Fprintln(out, "initialized in-memory store; nothing persisted (use --storage sqlite --db to pre-bake a database)")
 		}
 		return srv.Stop(context.Background())
@@ -211,9 +215,13 @@ func run(args []string, out io.Writer) error {
 	fmt.Fprintf(out, "cinc-server-ng listening on %s\n", srv.URL())
 	fmt.Fprintf(out, "  orgs: %s\n  admin user: %s (auth %s, acl-enforcement %s)\n",
 		f.orgsCSV, srv.AdminName(), authState(f.noAuth), enforceState(f.enforceACLs))
-	if f.storage == "sqlite" {
+	switch f.storage {
+	case "sqlite":
 		fmt.Fprintf(out, "  storage: sqlite (%s)\n", f.db)
-	} else {
+	case "postgres":
+		// Never print the connection string as given: it carries the password.
+		fmt.Fprintf(out, "  storage: postgres (%s)\n", postgres.Redact(f.db))
+	default:
 		fmt.Fprintf(out, "  storage: memory (ephemeral)\n")
 	}
 	if f.repo != "" {
