@@ -73,10 +73,10 @@ jobs:
           [ "$code" -lt 300 ] || { head -c 400 dd_resp.json; echo; exit 1; }
 
   # Trivy fs: dependency CVEs, IaC/Dockerfile misconfig, secrets. Fails on
-  # CRITICAL but never blocks (continue-on-error), like allow_failure in GitLab.
+  # CRITICAL but never blocks the run (step-level continue-on-error; Forgejo
+  # ignores it at job level), like allow_failure in GitLab.
   trivy:
     runs-on: host
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: trivy fs
@@ -105,6 +105,7 @@ jobs:
           echo "trivy -> DefectDojo HTTP $code"
           [ "$code" -lt 300 ] || { head -c 400 dd_resp.json; echo; exit 1; }
       - name: fail on CRITICAL
+        continue-on-error: true
         run: |
           python3 - <<'PY'
           import json, os, sys
@@ -120,19 +121,21 @@ jobs:
           PY
 
   # ------------------------------------------------------------- lint ---
-  # Each runs only if matching files exist, and warns instead of failing.
+  # Each runs only if matching files exist and warns instead of failing: the
+  # step shows the problem, the job and run stay green.
   lint:
     runs-on: host
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
         if: ${{ always() }}
+        continue-on-error: true
         run: |
           files=$(git ls-files '*.sh' '*.bash'); [ -n "$files" ] || { echo "no shell scripts"; exit 0; }
           docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/mnt -w /mnt "$SHELLCHECK_IMAGE" shellcheck -S warning $files
       - name: yamllint
         if: ${{ always() }}
+        continue-on-error: true
         run: |
           files=$(git ls-files '*.yml' '*.yaml' | grep -v '^\.kitchen' || true); [ -n "$files" ] || { echo "no yaml files"; exit 0; }
           conf='{extends: relaxed, rules: {line-length: disable, document-start: disable, truthy: disable}}'
@@ -140,12 +143,14 @@ jobs:
           docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/code -w /code "$YAMLLINT_IMAGE" yamllint ${conf:+-d "$conf"} $files
       - name: python compile
         if: ${{ always() }}
+        continue-on-error: true
         run: |
           files=$(git ls-files '*.py'); [ -n "$files" ] || { echo "no python files"; exit 0; }
           docker run --rm --user "$(id -u):$(id -g)" -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD":/src -w /src "$PYTHON_IMAGE" python -m py_compile $files
           echo "all python files compile"
       - name: ruby (cookstyle)
         if: ${{ always() }}
+        continue-on-error: true
         run: |
           # cookbooks get the full cookstyle job instead
           [ -f metadata.rb ] && { echo "cookbook: see cookstyle job"; exit 0; }
