@@ -1,0 +1,153 @@
+# MANAGED BY peach/ci (templates/) - DO NOT EDIT HERE.
+# Every push to peach/ci and a nightly job rewrite this file in every peach
+# repo. Change the templates in peach/ci instead. Per-repo settings go in
+# .forgejo/ci.env (KEY=value lines; never overwritten):
+#   COOKBOOK, TEST_DEPS, INTEGRATION_RUNLIST, SKIP_INTEGRATION=true
+# Extra pipelines for one repo belong in another file under .forgejo/workflows/.
+name: peach-ci
+on: [push, pull_request, workflow_dispatch]
+
+env:
+  CHEF_LICENSE: accept
+  WS_IMAGE: chef/chefworkstation:latest
+  GITLEAKS_IMAGE: zricethezav/gitleaks:v8.24.3
+  TRIVY_IMAGE: aquasec/trivy:0.68.1
+  SHELLCHECK_IMAGE: koalaman/shellcheck-alpine:v0.10.0
+  YAMLLINT_IMAGE: pipelinecomponents/yamllint:latest
+  PYTHON_IMAGE: python:3.12-slim
+  TRIVY_SEVERITY: HIGH,CRITICAL
+  TRIVY_FAIL_ON: CRITICAL
+  TRIVY_CACHE: /var/lib/forgejo-runner/.cache/trivy
+  DD_URL: http://vulnscan.home.arpa:8080
+  DD_PRODUCT_TYPE: Code Repositories
+  WORKSTATION: dirk@cinc-workstation.home.arpa
+  KNIFE_HOME_DIR: /home/dirk/.chef-cinc-upload
+  SUPERMARKET_URL: https://supermarket.home.arpa
+  SSH_OPTS: -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------- security ---
+  # gitleaks over the full history. BLOCKING: a leaked secret fails the run.
+  secrets:
+    runs-on: host
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        run: |
+          cfg=""; [ -f .gitleaks.toml ] && cfg="--config /repo/.gitleaks.toml"
+          set +e
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/repo -w /repo "$GITLEAKS_IMAGE" \
+            git /repo $cfg --redact --no-banner --report-format json --report-path /repo/gitleaks.json
+          rc=$?; set -e
+          [ -f gitleaks.json ] || echo "[]" > gitleaks.json
+          n=$(python3 -c 'import json;print(len(json.load(open("gitleaks.json"))))')
+          echo "gitleaks findings: $n"
+          if [ "$rc" -ne 0 ] && [ "$n" -gt 0 ]; then
+            python3 -c 'import json
+          for f in json.load(open("gitleaks.json")): print("  -", f.get("RuleID"), f.get("File"), "line", f.get("StartLine"), "commit", (f.get("Commit") or "")[:8])'
+            echo "Secrets found. Remove them, rotate the credential, and allowlist confirmed false positives in .gitleaks.toml."
+            exit 1
+          fi
+      - name: DefectDojo import
+        if: ${{ always() && github.event_name == 'push' && github.ref_name == github.event.repository.default_branch }}
+        env:
+          DD_API_TOKEN: ${{ secrets.DD_API_TOKEN }}
+        run: |
+          f=gitleaks.json; [ -s "$f" ] || { echo "skip gitleaks: no report"; exit 0; }
+          [ -n "$DD_API_TOKEN" ] || { echo "no DD_API_TOKEN secret: skipping import"; exit 0; }
+          code=$(curl -s -o dd_resp.json -w '%{http_code}' -X POST "$DD_URL/api/v2/reimport-scan/" \
+            -H "Authorization: Token $DD_API_TOKEN" -F "scan_type=Gitleaks Scan" -F "file=@$f" \
+            -F "product_type_name=$DD_PRODUCT_TYPE" -F "product_name=${{ github.repository }}" \
+            -F "engagement_name=CI default branch" -F "test_title=gitleaks" \
+            -F "auto_create_context=true" -F "close_old_findings=true" -F "deduplication_on_engagement=true" \
+            -F "branch_tag=${{ github.ref_name }}" -F "commit_hash=${{ github.sha }}" \
+            -F "build_id=${{ github.run_number }}" -F "source_code_management_uri=${{ github.server_url }}/${{ github.repository }}" \
+            -F "scan_date=$(date +%F)")
+          echo "gitleaks -> DefectDojo HTTP $code"
+          [ "$code" -lt 300 ] || { head -c 400 dd_resp.json; echo; exit 1; }
+
+  # Trivy fs: dependency CVEs, IaC/Dockerfile misconfig, secrets. Fails on
+  # CRITICAL but never blocks (continue-on-error), like allow_failure in GitLab.
+  trivy:
+    runs-on: host
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: trivy fs
+        run: |
+          mkdir -p "$TRIVY_CACHE"
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/repo -v "$TRIVY_CACHE":/cache "$TRIVY_IMAGE" \
+            fs --cache-dir /cache --quiet --scanners vuln,misconfig,secret --skip-java-db-update \
+            --skip-dirs .git --format json --output /repo/trivy.json /repo
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/repo -v "$TRIVY_CACHE":/cache "$TRIVY_IMAGE" \
+            convert --cache-dir /cache --format table --severity "$TRIVY_SEVERITY" /repo/trivy.json
+      - name: DefectDojo import
+        if: ${{ always() && github.event_name == 'push' && github.ref_name == github.event.repository.default_branch }}
+        env:
+          DD_API_TOKEN: ${{ secrets.DD_API_TOKEN }}
+        run: |
+          f=trivy.json; [ -s "$f" ] || { echo "skip trivy: no report"; exit 0; }
+          [ -n "$DD_API_TOKEN" ] || { echo "no DD_API_TOKEN secret: skipping import"; exit 0; }
+          code=$(curl -s -o dd_resp.json -w '%{http_code}' -X POST "$DD_URL/api/v2/reimport-scan/" \
+            -H "Authorization: Token $DD_API_TOKEN" -F "scan_type=Trivy Scan" -F "file=@$f" \
+            -F "product_type_name=$DD_PRODUCT_TYPE" -F "product_name=${{ github.repository }}" \
+            -F "engagement_name=CI default branch" -F "test_title=trivy" \
+            -F "auto_create_context=true" -F "close_old_findings=true" -F "deduplication_on_engagement=true" \
+            -F "branch_tag=${{ github.ref_name }}" -F "commit_hash=${{ github.sha }}" \
+            -F "build_id=${{ github.run_number }}" -F "source_code_management_uri=${{ github.server_url }}/${{ github.repository }}" \
+            -F "scan_date=$(date +%F)")
+          echo "trivy -> DefectDojo HTTP $code"
+          [ "$code" -lt 300 ] || { head -c 400 dd_resp.json; echo; exit 1; }
+      - name: fail on CRITICAL
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          fail = set(os.environ.get("TRIVY_FAIL_ON", "CRITICAL").split(","))
+          d = json.load(open("trivy.json")); bad = 0
+          for r in d.get("Results", []) or []:
+              for key in ("Vulnerabilities", "Misconfigurations", "Secrets"):
+                  for f in r.get(key) or []:
+                      if f.get("Severity") in fail and f.get("Status", "FAIL") != "PASS":
+                          bad += 1
+          print(f"trivy findings at {sorted(fail)}: {bad}")
+          sys.exit(1 if bad else 0)
+          PY
+
+  # ------------------------------------------------------------- lint ---
+  # Each runs only if matching files exist, and warns instead of failing.
+  lint:
+    runs-on: host
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        if: ${{ always() }}
+        run: |
+          files=$(git ls-files '*.sh' '*.bash'); [ -n "$files" ] || { echo "no shell scripts"; exit 0; }
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/mnt -w /mnt "$SHELLCHECK_IMAGE" shellcheck -S warning $files
+      - name: yamllint
+        if: ${{ always() }}
+        run: |
+          files=$(git ls-files '*.yml' '*.yaml' | grep -v '^\.kitchen' || true); [ -n "$files" ] || { echo "no yaml files"; exit 0; }
+          conf='{extends: relaxed, rules: {line-length: disable, document-start: disable, truthy: disable}}'
+          [ -f .yamllint ] && conf=""
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/code -w /code "$YAMLLINT_IMAGE" yamllint ${conf:+-d "$conf"} $files
+      - name: python compile
+        if: ${{ always() }}
+        run: |
+          files=$(git ls-files '*.py'); [ -n "$files" ] || { echo "no python files"; exit 0; }
+          docker run --rm --user "$(id -u):$(id -g)" -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD":/src -w /src "$PYTHON_IMAGE" python -m py_compile $files
+          echo "all python files compile"
+      - name: ruby (cookstyle)
+        if: ${{ always() }}
+        run: |
+          # cookbooks get the full cookstyle job instead
+          [ -f metadata.rb ] && { echo "cookbook: see cookstyle job"; exit 0; }
+          files=$(git ls-files '*.rb' '*.gemspec'); [ -n "$files" ] || { echo "no ruby files"; exit 0; }
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e CHEF_LICENSE=accept -v "$PWD":/work -w /work "$WS_IMAGE" cookstyle .
