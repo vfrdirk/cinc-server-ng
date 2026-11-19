@@ -1,0 +1,27 @@
+# Mirrors main and tags to the public fork github.com/vfrdirk/cinc-server-ng
+# (what GitLab's protected-branches-only push mirror did). Work branches stay
+# private here. Secret GH_MIRROR_TOKEN: GitHub token with push to the fork.
+name: github-mirror
+on:
+  push:
+    branches: [main]
+    tags: ["*"]
+  workflow_dispatch:
+
+jobs:
+  mirror:
+    runs-on: host
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: push main + tags to GitHub
+        env:
+          GH_MIRROR_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
+        run: |
+          [ -n "$GH_MIRROR_TOKEN" ] || { echo "no GH_MIRROR_TOKEN secret: skipping"; exit 0; }
+          git fetch -q origin main --tags
+          R="https://x-access-token:${GH_MIRROR_TOKEN}@github.com/vfrdirk/cinc-server-ng.git"
+          git push -q "$R" origin/main:refs/heads/main
+          git push -q "$R" --tags
+          echo "mirrored main ($(git rev-parse --short origin/main)) and tags to github.com/vfrdirk/cinc-server-ng"

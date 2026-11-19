@@ -1,0 +1,65 @@
+# cinc-server-ng's own pipeline (port of the GitLab go_lint/go_test/go_build
+# jobs). The shared security jobs come from peach-ci.yml, managed by peach/ci.
+name: go
+on: [push, pull_request, workflow_dispatch]
+
+env:
+  GO_IMAGE: golang:1.27
+  GOLANGCI_IMAGE: golangci/golangci-lint:v2.14.0
+  POSTGRES_IMAGE: postgres:17
+  GO_CACHE_DIR: /var/lib/forgejo-runner/.cache/go
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  go_lint:
+    runs-on: host
+    steps:
+      - uses: actions/checkout@v4
+      - name: golangci-lint
+        run: |
+          mkdir -p "$GO_CACHE_DIR/mod" "$GO_CACHE_DIR/build" "$GO_CACHE_DIR/lint"
+          GO_RUN="docker run --rm --user $(id -u):$(id -g) -v $PWD:/src -w /src -v $GO_CACHE_DIR/mod:/go/pkg/mod -v $GO_CACHE_DIR/build:/tmp/gocache -v $GO_CACHE_DIR/lint:/tmp/lintcache -e HOME=/tmp -e GOCACHE=/tmp/gocache -e GOLANGCI_LINT_CACHE=/tmp/lintcache -e GOFLAGS=-modcacherw"
+          $GO_RUN $GOLANGCI_IMAGE golangci-lint run ./...
+
+  go_test:
+    runs-on: host
+    steps:
+      - uses: actions/checkout@v4
+      - name: go test against a throwaway Postgres
+        run: |
+          mkdir -p "$GO_CACHE_DIR/mod" "$GO_CACHE_DIR/build" "$GO_CACHE_DIR/lint"
+          GO_RUN="docker run --rm --user $(id -u):$(id -g) -v $PWD:/src -w /src -v $GO_CACHE_DIR/mod:/go/pkg/mod -v $GO_CACHE_DIR/build:/tmp/gocache -e HOME=/tmp -e GOCACHE=/tmp/gocache -e GOFLAGS=-modcacherw"
+          NET="ci-${{ github.run_id }}-test"; PG="pg-${{ github.run_id }}-test"
+          docker network create "$NET" >/dev/null
+          docker run -d --rm --name "$PG" --network "$NET" -e POSTGRES_PASSWORD=ci "$POSTGRES_IMAGE" >/dev/null
+          # TCP check: first-boot init runs a temporary server on the unix socket only
+          for i in $(seq 1 60); do docker exec "$PG" pg_isready -h 127.0.0.1 -U postgres -q && break; sleep 1; done
+          docker exec "$PG" pg_isready -h 127.0.0.1 -U postgres
+          $GO_RUN --network "$NET" -e CINC_SERVER_NG_TEST_POSTGRES="postgres://postgres:ci@$PG:5432/postgres?sslmode=disable" \
+            $GO_IMAGE go test ./... -race -cover
+      - name: cleanup
+        if: ${{ always() }}
+        run: |
+          docker rm -f "pg-${{ github.run_id }}-test" >/dev/null 2>&1 || true
+          docker network rm "ci-${{ github.run_id }}-test" >/dev/null 2>&1 || true
+
+  go_build:
+    needs: [go_test]
+    runs-on: host
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history + tags, so the version is `git describe`
+      - name: build
+        run: |
+          mkdir -p "$GO_CACHE_DIR/mod" "$GO_CACHE_DIR/build"
+          GO_RUN="docker run --rm --user $(id -u):$(id -g) -v $PWD:/src -w /src -v $GO_CACHE_DIR/mod:/go/pkg/mod -v $GO_CACHE_DIR/build:/tmp/gocache -e HOME=/tmp -e GOCACHE=/tmp/gocache -e GOFLAGS=-modcacherw"
+          VERSION=$(git describe --tags --always 2>/dev/null || echo dev); DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          $GO_RUN -e CGO_ENABLED=0 -e GOOS=linux -e GOARCH=amd64 $GO_IMAGE \
+            go build -trimpath -ldflags "-s -w -X main.version=$VERSION -X main.commit=${GITHUB_SHA::8} -X main.buildDate=$DATE" \
+            -o dist/cinc-server-ng ./cmd/cinc-server-ng
+          docker run --rm -v "$PWD/dist":/d -w /d $GO_IMAGE ./cinc-server-ng --version
+          sha256sum dist/cinc-server-ng | tee dist/cinc-server-ng.sha256
