@@ -18,7 +18,7 @@ env:
   TRIVY_SEVERITY: HIGH,CRITICAL
   TRIVY_FAIL_ON: CRITICAL
   TRIVY_CACHE: /var/lib/forgejo-runner/.cache/trivy
-  DD_URL: http://vulnscan.home.arpa:8080
+  DD_URL: https://vulnscan.home.arpa:8443
   DD_PRODUCT_TYPE: Code Repositories
   WORKSTATION: dirk@cinc-workstation.home.arpa
   KNIFE_HOME_DIR: /home/dirk/.chef-cinc-upload
